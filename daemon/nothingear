@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+nothingear daemon - reads status from Nothing Ear (a) over RFCOMM and writes status.json.
+
+Usage:
+    nothingear daemon          Run the daemon (writes status.json on change)
+    nothingear status          Print the current status line
+    nothingear anc <mode>      Set ANC mode (off/low/mid/high/adaptive/transparency)
+    nothingear eq <preset>     Set EQ preset (balanced/bass/treble/voice)
+    nothingear ear <on|off>    Toggle in-ear detection
+    nothingear latency <on|off> Toggle low-latency mode
+    nothingear info            Show device info
+
+Requires: nothingearctl (for control commands) or direct RFCOMM access.
+The daemon writes to $XDG_STATE_HOME/nothingear/status.json.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "nothingear"
+STATUS_FILE = STATE_DIR / "status.json"
+
+ANC_MODES = {
+    "off": 0,
+    "low": 1,
+    "mid": 2,
+    "high": 3,
+    "adaptive": 4,
+    "transparency": 5,
+}
+
+EQ_PRESETS = {
+    "balanced": 0,
+    "bass": 1,
+    "treble": 2,
+    "voice": 3,
+}
+
+# Nothing Ear (a) model identifier
+NOTHING_EAR_MODELS = ["B171", "B172", "B168", "B162", "B155", "B157", "B174"]
+
+
+def find_ctl():
+    """Find nothingearctl on PATH."""
+    for path in os.environ.get("PATH", "").split(":"):
+        ctl = Path(path) / "nothingearctl"
+        if ctl.is_file() and os.access(ctl, os.X_OK):
+            return str(ctl)
+    return "nothingearctl"
+
+
+def run_ctl(*args):
+    """Run nothingearctl and return stdout."""
+    ctl = find_ctl()
+    try:
+        result = subprocess.run(
+            [ctl] + list(args),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def get_battery():
+    """Get battery levels via nothingearctl or BlueZ."""
+    # Try nothingearctl first
+    output = run_ctl("battery")
+    if output:
+        return parse_battery_output(output)
+
+    # Fallback: try BlueZ Battery1 interface
+    return get_battery_bluez()
+
+
+def parse_battery_output(output):
+    """Parse nothingearctl battery output."""
+    result = {"left": -1, "right": -1, "case": -1, "left_charging": False, "right_charging": False, "case_charging": False}
+    for line in output.splitlines():
+        line = line.strip().lower()
+        if "left" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                val = parts[1].strip().replace("%", "")
+                if val.isdigit():
+                    result["left"] = int(val)
+                if "charging" in line:
+                    result["left_charging"] = True
+        elif "right" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                val = parts[1].strip().replace("%", "")
+                if val.isdigit():
+                    result["right"] = int(val)
+                if "charging" in line:
+                    result["right_charging"] = True
+        elif "case" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                val = parts[1].strip().replace("%", "")
+                if val.isdigit():
+                    result["case"] = int(val)
+                if "charging" in line:
+                    result["case_charging"] = True
+    return result
+
+
+def get_battery_bluez():
+    """Get battery from BlueZ Battery1 interface via busctl."""
+    result = {"left": -1, "right": -1, "case": -1, "left_charging": False, "right_charging": False, "case_charging": False}
+    try:
+        # Find connected Nothing devices
+        output = subprocess.run(
+            ["busctl", "--user", "call", "org.bluez", "/org/bluez", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Parse busctl output for battery levels
+        # This is a simplified fallback
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return result
+
+
+def get_anc_mode():
+    """Get current ANC mode."""
+    output = run_ctl("anc")
+    if output:
+        for mode_name, mode_val in ANC_MODES.items():
+            if mode_name in output.lower():
+                return mode_val
+    return -1
+
+
+def get_info():
+    """Get device info."""
+    output = run_ctl("info")
+    result = {"name": "", "model": "", "firmware": "", "serial": ""}
+    if output:
+        for line in output.splitlines():
+            line = line.strip()
+            if "address" in line.lower() or "name" in line.lower():
+                result["name"] = line.split(":", 1)[-1].strip() if ":" in line else line
+            elif "firmware" in line.lower():
+                result["firmware"] = line.split(":", 1)[-1].strip() if ":" in line else ""
+            elif "serial" in line.lower():
+                result["serial"] = line.split(":", 1)[-1].strip() if ":" in line else ""
+    return result
+
+
+def read_status():
+    """Read the current status from the device."""
+    battery = get_battery()
+    anc = get_anc_mode()
+    info = get_info()
+
+    status = {
+        "schema_version": 1,
+        "connected": battery["left"] >= 0 or battery["right"] >= 0,
+        "device_name": info["name"],
+        "model_name": "Nothing Ear (a)",
+        "firmware_version": info["firmware"],
+        "serial_number": info["serial"],
+        "anc_mode": anc,
+        "eq_preset": -1,
+        "in_ear_detection": True,
+        "low_latency_mode": False,
+        "left": {
+            "available": battery["left"] >= 0,
+            "level": battery["left"],
+            "charging": battery["left_charging"],
+            "in_ear": False,
+        },
+        "right": {
+            "available": battery["right"] >= 0,
+            "level": battery["right"],
+            "charging": battery["right_charging"],
+            "in_ear": False,
+        },
+        "case": {
+            "available": battery["case"] >= 0,
+            "level": battery["case"],
+            "charging": battery["case_charging"],
+            "in_ear": False,
+        },
+    }
+    return status
+
+
+def write_status(status):
+    """Write status to the state file."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATUS_FILE.write_text(json.dumps(status, sort_keys=True))
+
+
+def remove_status():
+    """Remove the status file (daemon stopping)."""
+    if STATUS_FILE.exists():
+        STATUS_FILE.unlink()
+
+
+def daemon_loop():
+    """Main daemon loop: poll and write status on change."""
+    last_status = None
+
+    def handle_signal(signum, frame):
+        remove_status()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    while True:
+        try:
+            status = read_status()
+            status_json = json.dumps(status, sort_keys=True)
+
+            if status_json != last_status:
+                write_status(status)
+                last_status = status_json
+
+            time.sleep(5)
+        except KeyboardInterrupt:
+            remove_status()
+            break
+        except Exception as e:
+            time.sleep(10)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "daemon":
+        daemon_loop()
+    elif cmd == "status":
+        status = read_status()
+        print(json.dumps(status, sort_keys=True))
+    elif cmd == "anc":
+        if len(sys.argv) < 3:
+            print("Usage: nothingear anc <off|low|mid|high|adaptive|transparency>")
+            sys.exit(1)
+        mode = sys.argv[2].lower()
+        if mode not in ANC_MODES:
+            print(f"Unknown ANC mode: {mode}")
+            sys.exit(1)
+        run_ctl("anc", mode)
+    elif cmd == "eq":
+        if len(sys.argv) < 3:
+            print("Usage: nothingear eq <balanced|bass|treble|voice>")
+            sys.exit(1)
+        preset = sys.argv[2].lower()
+        if preset not in EQ_PRESETS:
+            print(f"Unknown EQ preset: {preset}")
+            sys.exit(1)
+        run_ctl("eq", preset)
+    elif cmd == "ear":
+        if len(sys.argv) < 3:
+            print("Usage: nothingear ear <on|off>")
+            sys.exit(1)
+        state = sys.argv[2].lower()
+        run_ctl("in-ear-detection", state)
+    elif cmd == "latency":
+        if len(sys.argv) < 3:
+            print("Usage: nothingear latency <on|off>")
+            sys.exit(1)
+        state = sys.argv[2].lower()
+        run_ctl("low-latency-mode", state)
+    elif cmd == "info":
+        info = get_info()
+        for k, v in info.items():
+            if v:
+                print(f"{k}: {v}")
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

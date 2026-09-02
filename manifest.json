@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.pioluk.omnothingear",
+  "name": "Nothing Ear",
+  "version": "1.0.0",
+  "author": "pioluk",
+  "license": "MIT",
+  "description": "Nothing Ear (a) in the Omarchy bar: per-bud and case battery, ANC mode, EQ preset, in-ear detection, low-latency mode.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Nothing Ear",
+    "description": "Battery for each bud and the case, plus ANC, EQ and in-ear controls.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenDisconnected": true,
+      "ctlPath": ""
+    },
+    "schema": [
+      {
+        "key": "hideWhenDisconnected",
+        "type": "boolean",
+        "label": "Hide the icon when no Nothing Ear are connected",
+        "defaultValue": true
+      },
+      {
+        "key": "ctlPath",
+        "type": "path",
+        "label": "Path to nothingearctl",
+        "description": "Leave empty to find nothingearctl on PATH.",
+        "defaultValue": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+#!/bin/bash
+# omarchy plugin add only clones files, so this is the rest of the install.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+daemon="$root/daemon"
+
+# Install nothingearctl if not present
+if ! command -v nothingearctl &>/dev/null; then
+    echo "Installing nothingearctl..."
+    if command -v cargo &>/dev/null; then
+        cargo install nothingearctl
+    elif command -v pacman &>/dev/null; then
+        # Try AUR if on Arch
+        if command -v yay &>/dev/null; then
+            yay -S nothingearctl
+        elif command -v paru &>/dev/null; then
+            paru -S nothingearctl
+        else
+            echo "Install nothingearctl manually: https://github.com/OctopusET/nothingearctl"
+            echo "Or run: cargo install nothingearctl"
+        fi
+    else
+        echo "Install nothingearctl manually: https://github.com/OctopusET/nothingearctl"
+        echo "Or run: cargo install nothingearctl"
+    fi
+fi
+
+# Install the daemon wrapper script
+chmod +x "$daemon/nothingear"
+mkdir -p "$HOME/.local/bin"
+cp "$daemon/nothingear" "$HOME/.local/bin/nothingear"
+chmod +x "$HOME/.local/bin/nothingear"
+
+# Create systemd user service
+mkdir -p "$HOME/.config/systemd/user"
+cat > "$HOME/.config/systemd/user/nothingear.service" << 'EOF'
+[Unit]
+Description=Nothing Ear daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nothingear daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable nothingear.service
+systemctl --user restart nothingear.service
+
+echo "nothingear daemon is running."
+echo "The bar icon stays hidden until Nothing Ear are connected."
+echo "Keep it visible: omarchy bar set io.github.pioluk.omnothingear hideWhenDisconnected false --json"
