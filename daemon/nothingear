@@ -1,288 +1,774 @@
 #!/usr/bin/env python3
 """
-nothingear daemon - reads status from Nothing Ear (a) over RFCOMM and writes status.json.
+nothingear daemon - publish Nothing Ear status for the Omarchy bar.
 
 Usage:
-    nothingear daemon          Run the daemon (writes status.json on change)
-    nothingear status          Print the current status line
-    nothingear anc <mode>      Set ANC mode (off/low/mid/high/adaptive/transparency)
-    nothingear eq <preset>     Set EQ preset (balanced/bass/treble/voice)
-    nothingear ear <on|off>    Toggle in-ear detection
-    nothingear latency <on|off> Toggle low-latency mode
-    nothingear info            Show device info
+    nothingear daemon
+    nothingear status
+    nothingear info
+    nothingear anc <off|low|mid|high|adaptive|transparency>
+    nothingear eq <balanced|bass|treble|voice>
+    nothingear ear <on|off>
+    nothingear latency <on|off>
 
-Requires: nothingearctl (for control commands) or direct RFCOMM access.
-The daemon writes to $XDG_STATE_HOME/nothingear/status.json.
+The daemon talks to Nothing earbuds directly over RFCOMM and writes
+$XDG_STATE_HOME/nothingear/status.json. Command invocations enqueue a small
+request for the already-running daemon, so the panel does not compete for the
+same RFCOMM socket.
+
+Protocol constants are based on the public Nothing Ear protocol work in
+Something X and earctl.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "nothingear"
 STATUS_FILE = STATE_DIR / "status.json"
+COMMAND_DIR = STATE_DIR / "commands"
 
-ANC_MODES = {
-    "off": 0,
-    "low": 1,
-    "mid": 2,
-    "high": 3,
-    "adaptive": 4,
-    "transparency": 5,
+SCHEMA_VERSION = 1
+POLL_INTERVAL_SECONDS = 5.0
+CONNECT_RETRY_SECONDS = 5.0
+COMMAND_POLL_SECONDS = 0.2
+SOCKET_TIMEOUT_SECONDS = 0.5
+
+SOF = 0x55
+CTRL_HOST_CRC = 0x0160
+
+CMD_PROTO_VERSION = 0xC001
+CMD_REMOTE_CONF = 0xC006
+CMD_BATTERY = 0xC007
+CMD_EARPHONE = 0xC00A
+CMD_IN_EAR = 0xC00E
+CMD_NOISE_RED = 0xC01E
+CMD_EQ_MODE = 0xC01F
+CMD_LATENCY = 0xC041
+CMD_HOST_VERSION = 0xC042
+
+CMD_SET_ACTIVATED = 0xF001
+CMD_SET_IN_EAR = 0xF004
+CMD_SET_NOISE_RED = 0xF00F
+CMD_SET_EQ = 0xF010
+CMD_SET_LATENCY = 0xF040
+
+EVT_BATTERY = 0xE001
+EVT_STATUS = 0xE002
+EVT_NOISE_RED = 0xE003
+
+LEGACY_DEVICE_HEADER = 0x03
+LEGACY_HOST_HEADER = 0x02
+LEGACY_INIT = 0x01
+LEGACY_BATTERY = 0x03
+
+BAT_LEFT = 0x02
+BAT_RIGHT = 0x03
+BAT_CASE = 0x04
+
+ANC_OFF = 0
+ANC_LOW = 1
+ANC_MID = 2
+ANC_HIGH = 3
+ANC_ADAPTIVE = 4
+ANC_TRANSPARENCY = 5
+ANC_UNKNOWN = -1
+
+EQ_BALANCED = 0
+EQ_MORE_BASS = 1
+EQ_MORE_TREBLE = 2
+EQ_VOICE = 3
+EQ_UNKNOWN = -1
+
+ANC_VALUES = {
+    "off": ANC_OFF,
+    "low": ANC_LOW,
+    "mid": ANC_MID,
+    "high": ANC_HIGH,
+    "adaptive": ANC_ADAPTIVE,
+    "transparency": ANC_TRANSPARENCY,
 }
 
-EQ_PRESETS = {
-    "balanced": 0,
-    "bass": 1,
-    "treble": 2,
-    "voice": 3,
+EQ_VALUES = {
+    "balanced": EQ_BALANCED,
+    "bass": EQ_MORE_BASS,
+    "treble": EQ_MORE_TREBLE,
+    "voice": EQ_VOICE,
 }
 
-# Nothing Ear (a) model identifier
-NOTHING_EAR_MODELS = ["B171", "B172", "B168", "B162", "B155", "B157", "B174"]
+ANC_TO_DEVICE = {
+    ANC_OFF: 0x05,
+    ANC_LOW: 0x03,
+    ANC_MID: 0x02,
+    ANC_HIGH: 0x01,
+    ANC_ADAPTIVE: 0x04,
+    ANC_TRANSPARENCY: 0x07,
+}
+
+DEVICE_TO_ANC = {value: mode for mode, value in ANC_TO_DEVICE.items()}
+
+PROBE_CHANNELS = [15, 17, 16, 18, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+DEVICE_NAME_HINTS = ("nothing ear", "cmf buds")
 
 
-def find_ctl():
-    """Find nothingearctl on PATH."""
-    for path in os.environ.get("PATH", "").split(":"):
-        ctl = Path(path) / "nothingearctl"
-        if ctl.is_file() and os.access(ctl, os.X_OK):
-            return str(ctl)
-    return "nothingearctl"
+@dataclass
+class Pod:
+    level: int = -1
+    charging: bool = False
+    in_ear: bool = False
+
+    def as_status(self) -> dict[str, Any]:
+        return {
+            "available": self.level >= 0,
+            "level": self.level,
+            "charging": self.charging,
+            "in_ear": self.in_ear,
+        }
 
 
-def run_ctl(*args):
-    """Run nothingearctl and return stdout."""
-    ctl = find_ctl()
-    try:
-        result = subprocess.run(
-            [ctl] + list(args),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
+@dataclass
+class DeviceState:
+    connected: bool = False
+    address: str = ""
+    device_name: str = ""
+    model_name: str = "Nothing Ear (a)"
+    firmware_version: str = ""
+    serial_number: str = ""
+    anc_mode: int = ANC_UNKNOWN
+    eq_preset: int = EQ_UNKNOWN
+    in_ear_detection: bool = True
+    low_latency_mode: bool = False
+    left: Pod = field(default_factory=Pod)
+    right: Pod = field(default_factory=Pod)
+    case: Pod = field(default_factory=Pod)
+    last_error: str = ""
+    battery_payload_hex: str = ""
+    battery_entries: list[dict[str, int | bool]] = field(default_factory=list)
+
+    def as_status(self) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "connected": self.connected,
+            "device_name": self.device_name,
+            "model_name": self.model_name,
+            "firmware_version": self.firmware_version,
+            "serial_number": self.serial_number,
+            "anc_mode": self.anc_mode,
+            "eq_preset": self.eq_preset,
+            "in_ear_detection": self.in_ear_detection,
+            "low_latency_mode": self.low_latency_mode,
+            "left": self.left.as_status(),
+            "right": self.right.as_status(),
+            "case": self.case.as_status(),
+            "battery_payload_hex": self.battery_payload_hex,
+            "battery_entries": self.battery_entries,
+        }
 
 
-def get_battery():
-    """Get battery levels via nothingearctl or BlueZ."""
-    # Try nothingearctl first
-    output = run_ctl("battery")
-    if output:
-        return parse_battery_output(output)
-
-    # Fallback: try BlueZ Battery1 interface
-    return get_battery_bluez()
-
-
-def parse_battery_output(output):
-    """Parse nothingearctl battery output."""
-    result = {"left": -1, "right": -1, "case": -1, "left_charging": False, "right_charging": False, "case_charging": False}
-    for line in output.splitlines():
-        line = line.strip().lower()
-        if "left" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                val = parts[1].strip().replace("%", "")
-                if val.isdigit():
-                    result["left"] = int(val)
-                if "charging" in line:
-                    result["left_charging"] = True
-        elif "right" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                val = parts[1].strip().replace("%", "")
-                if val.isdigit():
-                    result["right"] = int(val)
-                if "charging" in line:
-                    result["right_charging"] = True
-        elif "case" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                val = parts[1].strip().replace("%", "")
-                if val.isdigit():
-                    result["case"] = int(val)
-                if "charging" in line:
-                    result["case_charging"] = True
-    return result
+def crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
 
 
-def get_battery_bluez():
-    """Get battery from BlueZ Battery1 interface via busctl."""
-    result = {"left": -1, "right": -1, "case": -1, "left_charging": False, "right_charging": False, "case_charging": False}
-    try:
-        # Find connected Nothing devices
-        output = subprocess.run(
-            ["busctl", "--user", "call", "org.bluez", "/org/bluez", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"],
-            capture_output=True, text=True, timeout=5,
-        )
-        # Parse busctl output for battery levels
-        # This is a simplified fallback
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return result
-
-
-def get_anc_mode():
-    """Get current ANC mode."""
-    output = run_ctl("anc")
-    if output:
-        for mode_name, mode_val in ANC_MODES.items():
-            if mode_name in output.lower():
-                return mode_val
-    return -1
-
-
-def get_info():
-    """Get device info."""
-    output = run_ctl("info")
-    result = {"name": "", "model": "", "firmware": "", "serial": ""}
-    if output:
-        for line in output.splitlines():
-            line = line.strip()
-            if "address" in line.lower() or "name" in line.lower():
-                result["name"] = line.split(":", 1)[-1].strip() if ":" in line else line
-            elif "firmware" in line.lower():
-                result["firmware"] = line.split(":", 1)[-1].strip() if ":" in line else ""
-            elif "serial" in line.lower():
-                result["serial"] = line.split(":", 1)[-1].strip() if ":" in line else ""
-    return result
-
-
-def read_status():
-    """Read the current status from the device."""
-    battery = get_battery()
-    anc = get_anc_mode()
-    info = get_info()
-
-    status = {
-        "schema_version": 1,
-        "connected": battery["left"] >= 0 or battery["right"] >= 0,
-        "device_name": info["name"],
-        "model_name": "Nothing Ear (a)",
-        "firmware_version": info["firmware"],
-        "serial_number": info["serial"],
-        "anc_mode": anc,
-        "eq_preset": -1,
-        "in_ear_detection": True,
-        "low_latency_mode": False,
-        "left": {
-            "available": battery["left"] >= 0,
-            "level": battery["left"],
-            "charging": battery["left_charging"],
-            "in_ear": False,
-        },
-        "right": {
-            "available": battery["right"] >= 0,
-            "level": battery["right"],
-            "charging": battery["right_charging"],
-            "in_ear": False,
-        },
-        "case": {
-            "available": battery["case"] >= 0,
-            "level": battery["case"],
-            "charging": battery["case_charging"],
-            "in_ear": False,
-        },
-    }
-    return status
-
-
-def write_status(status):
-    """Write status to the state file."""
+def write_status(state: DeviceState) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATUS_FILE.write_text(json.dumps(status, sort_keys=True))
+    tmp = STATUS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state.as_status(), sort_keys=True))
+    tmp.replace(STATUS_FILE)
 
 
-def remove_status():
-    """Remove the status file (daemon stopping)."""
-    if STATUS_FILE.exists():
+def disconnected_status() -> DeviceState:
+    return DeviceState(connected=False, device_name="", model_name="Nothing Ear (a)")
+
+
+def read_cached_status() -> dict[str, Any]:
+    if not STATUS_FILE.exists():
+        return disconnected_status().as_status()
+    try:
+        return json.loads(STATUS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return disconnected_status().as_status()
+
+
+def remove_status() -> None:
+    try:
         STATUS_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
-def daemon_loop():
-    """Main daemon loop: poll and write status on change."""
-    last_status = None
+def run_output(command: list[str], timeout: float = 8.0) -> str:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout
 
-    def handle_signal(signum, frame):
-        remove_status()
-        sys.exit(0)
+
+def bluetooth_devices() -> list[dict[str, str]]:
+    output = run_output(["bluetoothctl", "devices", "Connected"], timeout=5.0)
+    if not output:
+        output = run_output(["bluetoothctl", "paired-devices"], timeout=5.0)
+
+    devices: list[dict[str, str]] = []
+    for line in output.splitlines():
+        parts = line.strip().split(" ", 2)
+        if len(parts) < 2 or parts[0] != "Device":
+            continue
+        address = parts[1]
+        name = parts[2] if len(parts) > 2 else ""
+        if any(hint in name.lower() for hint in DEVICE_NAME_HINTS):
+            devices.append({"address": address, "name": name})
+    return devices
+
+
+def is_connected(address: str) -> bool:
+    output = run_output(["bluetoothctl", "info", address], timeout=5.0)
+    for line in output.splitlines():
+        if line.strip().lower() == "connected: yes":
+            return True
+    return False
+
+
+def find_connected_device() -> dict[str, str] | None:
+    for device in bluetooth_devices():
+        if is_connected(device["address"]):
+            return device
+    return None
+
+
+def discover_channels(address: str) -> list[int]:
+    channels: list[int] = []
+    output = run_output(["sdptool", "browse", address], timeout=8.0)
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("Channel:"):
+            continue
+        try:
+            channels.append(int(line.split(":", 1)[1].strip()))
+        except ValueError:
+            pass
+
+    priority = [ch for ch in (15, 17, 16) if ch in channels]
+    rest = [ch for ch in channels if ch not in priority]
+    ordered = priority + rest + PROBE_CHANNELS
+    return list(dict.fromkeys(ordered))
+
+
+class NothingEarConnection:
+    def __init__(self, address: str, name: str):
+        self.address = address
+        self.name = name
+        self.sock: socket.socket | None = None
+        self.fsn = 0
+        self.activated = False
+        self.buf = b""
+        self.state = DeviceState(
+            connected=False,
+            address=address,
+            device_name=name,
+            model_name=name if name else "Nothing Ear (a)",
+        )
+        self.last_query = 0.0
+        self.connected_at = 0.0
+        self.sent_initial_queries = False
+
+    def connect(self) -> bool:
+        for channel in discover_channels(self.address):
+            result = self._try_channel(channel)
+            if result is None:
+                continue
+            self.sock, initial = result
+            self.sock.settimeout(SOCKET_TIMEOUT_SECONDS)
+            self.buf = initial
+            self.state.connected = True
+            self.connected_at = time.monotonic()
+            self._process_buffer()
+            return True
+        self.state.last_error = f"No responsive Nothing RFCOMM channel for {self.address}"
+        return False
+
+    def close(self) -> None:
+        if self.sock is None:
+            return
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.sock = None
+        self.state.connected = False
+        self.activated = False
+
+    def _try_channel(self, channel: int) -> tuple[socket.socket, bytes] | None:
+        try:
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            sock.settimeout(5.0)
+            sock.connect((self.address, channel))
+        except OSError:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return None
+
+        try:
+            probe = self._frame(CMD_PROTO_VERSION)
+            legacy_probe = bytes([LEGACY_HOST_HEADER, LEGACY_BATTERY, 0x00, 0x00])
+            sock.sendall(probe + legacy_probe)
+        except OSError:
+            sock.close()
+            return None
+
+        sock.settimeout(2.0)
+        data = b""
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(256)
+            except (TimeoutError, socket.timeout):
+                break
+            except OSError:
+                sock.close()
+                return None
+            if not chunk:
+                break
+            data += chunk
+            if len(data) >= 4:
+                break
+
+        if not data or data[0] not in (SOF, LEGACY_DEVICE_HEADER):
+            sock.close()
+            return None
+        return sock, data
+
+    def _frame(self, command: int, payload: bytes = b"") -> bytes:
+        self.fsn = (self.fsn + 1) & 0xFF
+        header = struct.pack("<BHHH", SOF, CTRL_HOST_CRC, command, len(payload)) + bytes([self.fsn])
+        return header + payload + struct.pack("<H", crc16(header + payload))
+
+    def send(self, command: int, payload: bytes = b"") -> None:
+        if self.sock is None:
+            raise RuntimeError("not connected")
+        self.sock.sendall(self._frame(command, payload))
+
+    def tick(self) -> bool:
+        if self.sock is None:
+            return False
+
+        try:
+            chunk = self.sock.recv(256)
+            if chunk:
+                self.buf += chunk
+                self._process_buffer()
+            else:
+                return False
+        except (TimeoutError, socket.timeout):
+            pass
+        except OSError:
+            return False
+
+        now = time.monotonic()
+        if not self.activated and now - self.connected_at > 3.0:
+            self.activated = True
+            self._query_all()
+
+        if now - self.last_query >= POLL_INTERVAL_SECONDS:
+            self._query_all()
+        return True
+
+    def _query_all(self) -> None:
+        if self.sock is None:
+            return
+        self.last_query = time.monotonic()
+        queries = [
+            (CMD_BATTERY, b""),
+            (CMD_NOISE_RED, bytes([0x03])),
+            (CMD_EQ_MODE, b""),
+            (CMD_EARPHONE, b""),
+            (CMD_IN_EAR, b""),
+            (CMD_LATENCY, b""),
+        ]
+        if not self.state.firmware_version:
+            queries.append((CMD_HOST_VERSION, b""))
+        if not self.state.serial_number:
+            queries.append((CMD_REMOTE_CONF, b""))
+
+        for command, payload in queries:
+            try:
+                self.send(command, payload)
+            except OSError:
+                self.close()
+                return
+
+    def apply_command(self, command: dict[str, Any]) -> None:
+        kind = command.get("kind")
+        value = command.get("value")
+        if kind == "anc":
+            mode = int(value)
+            self.send(CMD_SET_NOISE_RED, bytes([0x01, ANC_TO_DEVICE[mode], 0x00]))
+            self.state.anc_mode = mode
+        elif kind == "eq":
+            preset = int(value)
+            self.send(CMD_SET_EQ, bytes([preset, 0x00]))
+            self.state.eq_preset = preset
+        elif kind == "ear":
+            enabled = bool(value)
+            self.send(CMD_SET_IN_EAR, bytes([0x01, 0x01, 0x01 if enabled else 0x00]))
+            self.state.in_ear_detection = enabled
+        elif kind == "latency":
+            enabled = bool(value)
+            self.send(CMD_SET_LATENCY, bytes([0x01 if enabled else 0x02, 0x00]))
+            self.state.low_latency_mode = enabled
+        self.last_query = 0.0
+
+    def _process_buffer(self) -> None:
+        while self.buf:
+            if self.buf[0] == SOF:
+                before = self.buf
+                self._process_x55()
+                if self.buf != before:
+                    continue
+                return
+            if self.buf and self.buf[0] == LEGACY_DEVICE_HEADER:
+                before = self.buf
+                self._process_legacy()
+                if self.buf != before:
+                    continue
+                return
+            if self.buf:
+                self.buf = self.buf[1:]
+
+    def _process_x55(self) -> None:
+        while self.buf and self.buf[0] == SOF:
+            if len(self.buf) < 8:
+                return
+            _, ctrl, raw_command, length = struct.unpack_from("<BHHH", self.buf)
+            crc_size = 2 if ctrl & 0x20 else 0
+            total = 8 + length + crc_size
+            if len(self.buf) < total:
+                return
+            payload = self.buf[8 : 8 + length]
+            if crc_size:
+                expected = struct.unpack_from("<H", self.buf, 8 + length)[0]
+                actual = crc16(self.buf[: 8 + length])
+                if expected != actual:
+                    self.buf = self.buf[total:]
+                    continue
+            command = raw_command | 0x8000
+            self._dispatch(command, raw_command, payload)
+            self.buf = self.buf[total:]
+
+    def _dispatch(self, command: int, raw_command: int, payload: bytes) -> None:
+        if command == CMD_PROTO_VERSION:
+            self.send(CMD_SET_ACTIVATED)
+        elif command == CMD_SET_ACTIVATED:
+            self.activated = True
+            if not self.sent_initial_queries:
+                self.sent_initial_queries = True
+                self._query_all()
+        elif command == CMD_BATTERY or raw_command == EVT_BATTERY:
+            self._parse_battery(payload)
+        elif command == CMD_NOISE_RED or raw_command == EVT_NOISE_RED:
+            self._parse_anc(payload)
+        elif command == CMD_EQ_MODE:
+            if payload:
+                self.state.eq_preset = payload[0]
+        elif command == CMD_EARPHONE or raw_command == EVT_STATUS:
+            self._parse_earphone(payload)
+            if raw_command == EVT_STATUS:
+                self.send(CMD_EARPHONE)
+        elif command == CMD_IN_EAR:
+            if len(payload) >= 3:
+                self.state.in_ear_detection = payload[2] == 1
+        elif command == CMD_LATENCY:
+            if payload:
+                self.state.low_latency_mode = payload[0] == 1
+        elif command == CMD_HOST_VERSION:
+            self.state.firmware_version = payload.decode(errors="replace").strip("\x00").strip()
+        elif command == CMD_REMOTE_CONF:
+            serial = parse_serial(payload)
+            if serial:
+                self.state.serial_number = serial
+
+    def _parse_battery(self, payload: bytes) -> None:
+        self.state.battery_payload_hex = payload.hex()
+        self.state.battery_entries = []
+        if len(payload) < 3:
+            return
+        count = payload[0]
+        for idx in range(count):
+            offset = 1 + idx * 2
+            if offset + 1 >= len(payload):
+                break
+            device_id = payload[offset]
+            level_byte = payload[offset + 1]
+            self.state.battery_entries.append(
+                {
+                    "device_id": device_id,
+                    "level": level_byte & 0x7F,
+                    "charging": bool(level_byte & 0x80),
+                }
+            )
+            target = self._pod_for(device_id)
+            if target is None:
+                continue
+            target.level = level_byte & 0x7F
+            target.charging = bool(level_byte & 0x80)
+
+    def _parse_anc(self, payload: bytes) -> None:
+        if len(payload) < 2:
+            return
+        for idx in range(0, len(payload) - 1, 3):
+            entry_type = payload[idx]
+            value = payload[idx + 1]
+            if entry_type == 1 and value in DEVICE_TO_ANC:
+                self.state.anc_mode = DEVICE_TO_ANC[value]
+
+    def _parse_earphone(self, payload: bytes) -> None:
+        if len(payload) < 3:
+            return
+        count = payload[0]
+        for idx in range(count):
+            offset = 1 + idx * 2
+            if offset + 1 >= len(payload):
+                break
+            pod = self._pod_for(payload[offset])
+            if pod is not None:
+                pod.in_ear = bool(payload[offset + 1] & 0x04)
+
+    def _process_legacy(self) -> None:
+        while self.buf and self.buf[0] == LEGACY_DEVICE_HEADER:
+            if len(self.buf) < 4:
+                return
+            msg_type = self.buf[1]
+            length = struct.unpack(">H", self.buf[2:4])[0]
+            total = 4 + length
+            if len(self.buf) < total:
+                return
+            payload = self.buf[4:total]
+            if msg_type == LEGACY_BATTERY and len(payload) >= 2:
+                self.state.left.level = payload[0] if payload[0] <= 100 else -1
+                self.state.right.level = payload[1] if payload[1] <= 100 else -1
+                if len(payload) >= 3:
+                    self.state.case.level = payload[2] if payload[2] <= 100 else -1
+            elif msg_type == LEGACY_INIT and payload:
+                frame = bytes([LEGACY_HOST_HEADER, LEGACY_INIT]) + struct.pack(">H", len(payload)) + payload
+                if self.sock is not None:
+                    self.sock.sendall(frame)
+            self.buf = self.buf[total:]
+
+    def _pod_for(self, device_id: int) -> Pod | None:
+        if device_id == BAT_LEFT:
+            return self.state.left
+        if device_id == BAT_RIGHT:
+            return self.state.right
+        if device_id == BAT_CASE:
+            return self.state.case
+        return None
+
+
+def parse_serial(payload: bytes) -> str:
+    candidates = [payload, payload[7:] if len(payload) > 7 else b""]
+    for candidate in candidates:
+        text = candidate.decode(errors="replace").strip("\x00")
+        for line in text.splitlines():
+            parts = line.split(",", 2)
+            if len(parts) == 3 and parts[1].strip() == "4" and parts[2].strip():
+                return parts[2].strip()
+    return ""
+
+
+def command_files() -> list[Path]:
+    try:
+        return sorted(path for path in COMMAND_DIR.iterdir() if path.is_file())
+    except FileNotFoundError:
+        return []
+
+
+def enqueue(command: dict[str, Any]) -> None:
+    cached = read_cached_status()
+    if not cached.get("connected"):
+        raise RuntimeError("Nothing Ear daemon is running, but no earbuds are connected")
+    COMMAND_DIR.mkdir(parents=True, exist_ok=True)
+    path = COMMAND_DIR / f"{time.time_ns()}.{os.getpid()}.json"
+    path.write_text(json.dumps(command, sort_keys=True))
+
+
+def parse_bool(value: str) -> bool:
+    if value in ("on", "true", "yes", "1"):
+        return True
+    if value in ("off", "false", "no", "0"):
+        return False
+    raise ValueError(f"Expected on/off, got {value}")
+
+
+def parse_command_args(args: list[str]) -> dict[str, Any]:
+    if not args:
+        raise ValueError("missing command")
+
+    first = args[0].lower()
+    if ":" in first:
+        kind, value = first.split(":", 1)
+    else:
+        if len(args) < 2:
+            raise ValueError(f"missing value for {first}")
+        kind, value = first, args[1].lower()
+
+    if kind == "anc":
+        if value not in ANC_VALUES:
+            raise ValueError(f"unknown ANC mode: {value}")
+        return {"kind": "anc", "value": ANC_VALUES[value]}
+    if kind == "eq":
+        if value not in EQ_VALUES:
+            raise ValueError(f"unknown EQ preset: {value}")
+        return {"kind": "eq", "value": EQ_VALUES[value]}
+    if kind in ("ear", "in-ear", "in-ear-detection"):
+        return {"kind": "ear", "value": parse_bool(value)}
+    if kind in ("latency", "low-latency", "low-latency-mode"):
+        return {"kind": "latency", "value": parse_bool(value)}
+    raise ValueError(f"unknown command: {kind}")
+
+
+def process_queued_commands(connection: NothingEarConnection | None) -> bool:
+    changed = False
+    for path in command_files():
+        try:
+            command = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            command = None
+
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+        if connection is None or connection.sock is None or command is None:
+            continue
+        try:
+            connection.apply_command(command)
+            changed = True
+        except Exception as exc:
+            connection.state.last_error = str(exc)
+    return changed
+
+
+def daemon_loop() -> None:
+    should_exit = False
+
+    def handle_signal(signum: int, frame: Any) -> None:
+        nonlocal should_exit
+        should_exit = True
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    while True:
-        try:
-            status = read_status()
-            status_json = json.dumps(status, sort_keys=True)
+    connection: NothingEarConnection | None = None
+    next_connect = 0.0
+    next_bluez_check = 0.0
+    last_written = ""
 
-            if status_json != last_status:
-                write_status(status)
-                last_status = status_json
+    try:
+        while not should_exit:
+            now = time.monotonic()
 
-            time.sleep(5)
-        except KeyboardInterrupt:
-            remove_status()
-            break
-        except Exception as e:
-            time.sleep(10)
+            if connection is None and now >= next_connect:
+                device = find_connected_device()
+                if device is None:
+                    status = json.dumps(disconnected_status().as_status(), sort_keys=True)
+                    if status != last_written:
+                        write_status(disconnected_status())
+                        last_written = status
+                    next_connect = now + CONNECT_RETRY_SECONDS
+                else:
+                    candidate = NothingEarConnection(device["address"], device["name"])
+                    if candidate.connect():
+                        connection = candidate
+                        next_bluez_check = now + CONNECT_RETRY_SECONDS
+                    else:
+                        next_connect = now + CONNECT_RETRY_SECONDS
+
+            if connection is not None:
+                bluez_connected = True
+                if now >= next_bluez_check:
+                    bluez_connected = is_connected(connection.address)
+                    next_bluez_check = now + CONNECT_RETRY_SECONDS
+                if not bluez_connected or not connection.tick():
+                    connection.close()
+                    connection = None
+                    next_connect = now + CONNECT_RETRY_SECONDS
+                    write_status(disconnected_status())
+                    last_written = json.dumps(disconnected_status().as_status(), sort_keys=True)
+                else:
+                    if process_queued_commands(connection):
+                        connection._query_all()
+                    status = json.dumps(connection.state.as_status(), sort_keys=True)
+                    if status != last_written:
+                        write_status(connection.state)
+                        last_written = status
+
+            time.sleep(COMMAND_POLL_SECONDS)
+    finally:
+        if connection is not None:
+            connection.close()
+        remove_status()
 
 
-def main():
+def print_info(status: dict[str, Any]) -> None:
+    fields = {
+        "connected": status.get("connected", False),
+        "device_name": status.get("device_name", ""),
+        "model_name": status.get("model_name", ""),
+        "firmware_version": status.get("firmware_version", ""),
+        "serial_number": status.get("serial_number", ""),
+    }
+    for key, value in fields.items():
+        print(f"{key}: {value}")
+
+
+def main() -> None:
     if len(sys.argv) < 2:
-        print(__doc__)
+        print(__doc__.strip())
         sys.exit(1)
 
-    cmd = sys.argv[1]
-
-    if cmd == "daemon":
+    command = sys.argv[1].lower()
+    if command == "daemon":
         daemon_loop()
-    elif cmd == "status":
-        status = read_status()
-        print(json.dumps(status, sort_keys=True))
-    elif cmd == "anc":
-        if len(sys.argv) < 3:
-            print("Usage: nothingear anc <off|low|mid|high|adaptive|transparency>")
-            sys.exit(1)
-        mode = sys.argv[2].lower()
-        if mode not in ANC_MODES:
-            print(f"Unknown ANC mode: {mode}")
-            sys.exit(1)
-        run_ctl("anc", mode)
-    elif cmd == "eq":
-        if len(sys.argv) < 3:
-            print("Usage: nothingear eq <balanced|bass|treble|voice>")
-            sys.exit(1)
-        preset = sys.argv[2].lower()
-        if preset not in EQ_PRESETS:
-            print(f"Unknown EQ preset: {preset}")
-            sys.exit(1)
-        run_ctl("eq", preset)
-    elif cmd == "ear":
-        if len(sys.argv) < 3:
-            print("Usage: nothingear ear <on|off>")
-            sys.exit(1)
-        state = sys.argv[2].lower()
-        run_ctl("in-ear-detection", state)
-    elif cmd == "latency":
-        if len(sys.argv) < 3:
-            print("Usage: nothingear latency <on|off>")
-            sys.exit(1)
-        state = sys.argv[2].lower()
-        run_ctl("low-latency-mode", state)
-    elif cmd == "info":
-        info = get_info()
-        for k, v in info.items():
-            if v:
-                print(f"{k}: {v}")
-    else:
-        print(f"Unknown command: {cmd}")
+        return
+    if command == "status":
+        print(json.dumps(read_cached_status(), sort_keys=True))
+        return
+    if command == "info":
+        print_info(read_cached_status())
+        return
+
+    try:
+        enqueue(parse_command_args(sys.argv[1:]))
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
         sys.exit(1)
 
 

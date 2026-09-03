@@ -42,6 +42,12 @@ Panel {
     "Ears wide open"
   ]
   readonly property string heroPhraseText: activePhrases[phraseIndex % activePhrases.length]
+  readonly property string heroMetaText: {
+    var parts = []
+    parts.push("ANC: " + Model.ancModeName(pods.ancMode))
+    parts.push("EQ: " + Model.eqPresetName(pods.eqPreset))
+    return parts.join(" · ")
+  }
 
   readonly property bool ancVisible: pods.hasEarbuds
   readonly property bool eqVisible: pods.hasEarbuds
@@ -191,7 +197,7 @@ Panel {
             id: hero
             width: parent.width
             title: pods.modelName !== "" ? pods.modelName : (pods.deviceName !== "" ? pods.deviceName : "Nothing Ear")
-            meta: pods.hasEarbuds ? root.heroPhraseText
+            meta: pods.hasEarbuds ? root.heroMetaText
               : pods.schemaUnsupported ? "Unsupported status schema"
               : pods.daemonReachable ? "Not connected"
               : "nothingear daemon is not running"
@@ -218,7 +224,7 @@ Panel {
           }
 
           Column {
-            visible: pods.hasBattery
+            visible: pods.hasEarbuds || pods.hasBattery
             width: parent.width
             spacing: Style.space(10)
 
@@ -232,14 +238,29 @@ Panel {
               width: parent.width
               spacing: Style.space(6)
 
-              PodRow { width: parent.width; label: "Left"; pod: pods.leftPod }
-              PodRow { width: parent.width; label: "Right"; pod: pods.rightPod }
-              PodRow { width: parent.width; label: "Case"; pod: ({ level: pods.caseBattery.level, charging: pods.caseBattery.charging, inEar: false }) }
+              PodRow {
+                width: parent.width
+                label: "Left"
+                pod: pods.leftPod
+                meta: pods.leftPod.level === Model.LEVEL_UNKNOWN ? "Unknown" : ""
+              }
+              PodRow {
+                width: parent.width
+                label: "Right"
+                pod: pods.rightPod
+                meta: pods.rightPod.level === Model.LEVEL_UNKNOWN ? "Unknown" : ""
+              }
+              PodRow {
+                width: parent.width
+                label: "Case"
+                pod: ({ level: pods.caseBattery.level, charging: pods.caseBattery.charging, inEar: false })
+                meta: pods.caseBattery.level === Model.LEVEL_UNKNOWN ? "Unknown" : ""
+              }
             }
           }
 
           PanelSeparator {
-            visible: pods.hasBattery && pods.hasEarbuds
+            visible: pods.hasEarbuds
             foreground: root.foreground
           }
 

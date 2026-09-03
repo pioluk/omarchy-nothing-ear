@@ -32,8 +32,8 @@
       {
         "key": "ctlPath",
         "type": "path",
-        "label": "Path to nothingearctl",
-        "description": "Leave empty to find nothingearctl on PATH.",
+        "label": "Path to nothingear",
+        "description": "Leave empty to use the bundled nothingear command on PATH.",
         "defaultValue": ""
       }
     ]

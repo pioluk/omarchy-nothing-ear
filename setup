@@ -6,25 +6,13 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")" && pwd)
 daemon="$root/daemon"
 
-# Install nothingearctl if not present
-if ! command -v nothingearctl &>/dev/null; then
-    echo "Installing nothingearctl..."
-    if command -v cargo &>/dev/null; then
-        cargo install nothingearctl
-    elif command -v pacman &>/dev/null; then
-        # Try AUR if on Arch
-        if command -v yay &>/dev/null; then
-            yay -S nothingearctl
-        elif command -v paru &>/dev/null; then
-            paru -S nothingearctl
-        else
-            echo "Install nothingearctl manually: https://github.com/OctopusET/nothingearctl"
-            echo "Or run: cargo install nothingearctl"
-        fi
-    else
-        echo "Install nothingearctl manually: https://github.com/OctopusET/nothingearctl"
-        echo "Or run: cargo install nothingearctl"
-    fi
+if ! command -v bluetoothctl &>/dev/null; then
+    echo "bluetoothctl is required. On Omarchy/Arch, install bluez-utils."
+    exit 1
+fi
+
+if ! command -v sdptool &>/dev/null; then
+    echo "sdptool not found; channel probing will still run, but installing bluez-deprecated-tools improves discovery."
 fi
 
 # Install the daemon wrapper script

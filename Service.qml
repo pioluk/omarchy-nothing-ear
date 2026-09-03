@@ -24,7 +24,7 @@ Item {
   property string lastError: ""
   property string actionStatus: ""
 
-  readonly property string ctlPath: String(setting("ctlPath", "") || "nothingearctl")
+  readonly property string ctlPath: String(setting("ctlPath", "") || "nothingear")
   readonly property bool busy: commandProcess.running
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME")
     || Quickshell.env("HOME") + "/.local/state") + "/nothingear/status.json"
@@ -195,7 +195,7 @@ Item {
         root._clearPending()
         root.refresh()
         root._queued = null
-        root.actionStatus = Model.elideError(commandErr.text || "nothingearctl rejected the command")
+        root.actionStatus = Model.elideError(commandErr.text || "nothingear rejected the command")
         actionStatusTimer.restart()
       }
       if (root._queued) {
